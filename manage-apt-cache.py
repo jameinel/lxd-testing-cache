@@ -2,6 +2,8 @@
 """Local apt cache (apt-cacher-ng in an LXD container) for faster Juju/LXD tests."""
 
 import argparse
+import ipaddress
+import json
 import os
 import subprocess
 import sys
@@ -63,6 +65,20 @@ def cache_ip():
     p = run("lxc", "list", NAME, "-c4", "-f", "csv", check=False, capture=True)
     out = (p.stdout or "").strip()
     return out.split(" ")[0] if out else ""
+
+
+def bridge_cidr():
+    """CIDR of the LXD network the cache container is attached to, or ''."""
+    p = run("lxc", "query", f"/1.0/instances/{NAME}", check=False, capture=True)
+    try:
+        net = json.loads(p.stdout)["expanded_devices"]["eth0"]["network"]
+    except (ValueError, KeyError, TypeError):
+        return ""
+    p = run("lxc", "network", "get", net, "ipv4.address", check=False, capture=True)
+    try:
+        return str(ipaddress.ip_network((p.stdout or "").strip(), strict=False))
+    except ValueError:
+        return ""
 
 
 def reachable(ip):
@@ -234,11 +250,12 @@ def cmd_charmcraft_env(a):
     if not reachable(ip):
         print(f"apt cache at {url} is unreachable; not using a cache", file=sys.stderr)
         return
-    # Keep the user's existing exclusions and never proxy the cache itself or
-    # LXD container names.
+    # Keep the user's existing exclusions and never proxy the cache itself, the
+    # LXD bridge subnet (CIDR; not every tool supports it) or container names.
     existing = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
     entries = []
-    for e in [*existing.split(","), *NO_PROXY.split(","), "::1", ip, ".lxd"]:
+    for e in [*existing.split(","), *NO_PROXY.split(","), "::1", ip,
+              bridge_cidr(), ".lxd"]:
         e = e.strip()
         if e and e not in entries:
             entries.append(e)
