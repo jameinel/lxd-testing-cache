@@ -16,7 +16,6 @@ NAME = os.environ.get("CACHE_NAME", "apt-cache")
 IMAGE = os.environ.get("CACHE_IMAGE", "ubuntu:24.04")
 PORT = 3142
 LXD_CLOUD = os.environ.get("LXD_CLOUD_NAME", "lxd")
-DEFAULT_CONTROLLER = os.environ.get("JUJU_CONTROLLER", "lxd29")
 NO_PROXY = "localhost,127.0.0.1"
 
 EPILOG = textwrap.dedent(
@@ -25,9 +24,9 @@ EPILOG = textwrap.dedent(
       CACHE_NAME        cache container name           (default: apt-cache)
       CACHE_IMAGE       image for the container        (default: ubuntu:24.04)
       LXD_CLOUD_NAME    client-side Juju cloud name    (default: lxd)
-      JUJU_CONTROLLER   default CONTROLLER argument    (default: lxd29)
-
     notes:
+      Commands taking CONTROLLER default to Juju's current controller (which
+      juju itself picks from JUJU_CONTROLLER or 'juju switch').
       Juju model-defaults only affect models created afterwards; use 'apply'
       for existing models.
 
@@ -67,18 +66,35 @@ def cache_ip():
     return out.split(" ")[0] if out else ""
 
 
-def bridge_cidr():
-    """CIDR of the LXD network the cache container is attached to, or ''."""
-    p = run("lxc", "query", f"/1.0/instances/{NAME}", check=False, capture=True)
+def lxd_cidrs():
+    """IPv4/IPv6 CIDRs of every LXD-managed network (empty if lxc fails)."""
+    p = run("lxc", "query", "/1.0/networks?recursion=1", check=False, capture=True)
     try:
-        net = json.loads(p.stdout)["expanded_devices"]["eth0"]["network"]
-    except (ValueError, KeyError, TypeError):
-        return ""
-    p = run("lxc", "network", "get", net, "ipv4.address", check=False, capture=True)
-    try:
-        return str(ipaddress.ip_network((p.stdout or "").strip(), strict=False))
-    except ValueError:
-        return ""
+        networks = json.loads(p.stdout)
+    except (ValueError, TypeError):
+        return []
+    cidrs = []
+    for n in networks:
+        if not n.get("managed"):
+            continue
+        for key in ("ipv4.address", "ipv6.address"):
+            try:
+                cidr = str(ipaddress.ip_network(n["config"][key], strict=False))
+            except (KeyError, ValueError):  # unset, "none" or "auto"
+                continue
+            if cidr not in cidrs:
+                cidrs.append(cidr)
+    return cidrs
+
+
+def no_proxy_list(*extra):
+    """Deduplicated no-proxy entries: defaults, extras, then all LXD CIDRs."""
+    entries = []
+    for e in [*NO_PROXY.split(","), *extra, *lxd_cidrs()]:
+        e = e.strip()
+        if e and e not in entries:
+            entries.append(e)
+    return ",".join(entries)
 
 
 def reachable(ip):
@@ -143,7 +159,7 @@ def define_cloud(url):
               localhost: {{}}
             config:
               apt-http-proxy: {url}
-              apt-no-proxy: {NO_PROXY}
+              apt-no-proxy: {no_proxy_list()}
         """
     )
     # snap-confined juju cannot read /tmp
@@ -157,23 +173,32 @@ def define_cloud(url):
         run("juju", verb, LXD_CLOUD, "--client", "-f", f.name)
 
 
+def controller_args(a):
+    """`-c NAME` if given; otherwise juju uses its current controller."""
+    return ["-c", a.controller] if a.controller else []
+
+
+def controller_label(a):
+    return a.controller or "the current controller"
+
+
 def cmd_enable(a):
     create_container()
     url = proxy_url()
-    run("juju", "model-defaults", "-c", a.controller,
-        f"apt-http-proxy={url}", f"apt-no-proxy={NO_PROXY}")
+    run("juju", "model-defaults", *controller_args(a),
+        f"apt-http-proxy={url}", f"apt-no-proxy={no_proxy_list()}")
     define_cloud(url)
-    print(f"enabled: apt proxy {url} for new models on {a.controller}")
+    print(f"enabled: apt proxy {url} for new models on {controller_label(a)}")
 
 
 def cmd_disable(a):
-    run("juju", "model-defaults", "-c", a.controller, "--reset", "apt-http-proxy,apt-no-proxy")
+    run("juju", "model-defaults", *controller_args(a), "--reset", "apt-http-proxy,apt-no-proxy")
     run("juju", "remove-cloud", LXD_CLOUD, "--client", check=False, quiet=True)
     # A stopped container is what marks the cache as disabled; the cache is kept.
     if ok("lxc", "info", NAME):
         run("lxc", "config", "set", NAME, "boot.autostart=false")
         run("lxc", "stop", NAME, check=False, quiet=True)
-    print(f"disabled on {a.controller}")
+    print(f"disabled on {controller_label(a)}")
 
 
 def cmd_destroy(a):
@@ -185,7 +210,7 @@ def cmd_destroy(a):
 
 
 def _os_upgrade(a, value):
-    run("juju", "model-defaults", "-c", a.controller,
+    run("juju", "model-defaults", *controller_args(a),
         f"enable-os-upgrade={value}", f"enable-os-refresh-update={value}")
 
 
@@ -199,7 +224,7 @@ def cmd_restore_os_upgrade(a):
 
 def cmd_apply(a):
     run("juju", "model-config", "-m", a.model,
-        f"apt-http-proxy={proxy_url()}", f"apt-no-proxy={NO_PROXY}")
+        f"apt-http-proxy={proxy_url()}", f"apt-no-proxy={no_proxy_list()}")
 
 
 def cmd_refresh_images(a):
@@ -218,7 +243,7 @@ def cmd_refresh_images(a):
 
 def cmd_status(a):
     run("lxc", "list", NAME, "-c", "ns4", check=False)
-    p = run("juju", "model-defaults", "-c", a.controller, check=False, capture=True)
+    p = run("juju", "model-defaults", *controller_args(a), check=False, capture=True)
     for line in (p.stdout or "").splitlines():
         if line.startswith(("apt-http-proxy", "apt-no-proxy", "enable-os-")):
             print(line)
@@ -253,13 +278,7 @@ def cmd_charmcraft_env(a):
     # Keep the user's existing exclusions and never proxy the cache itself, the
     # LXD bridge subnet (CIDR; not every tool supports it) or container names.
     existing = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
-    entries = []
-    for e in [*existing.split(","), *NO_PROXY.split(","), "::1", ip,
-              bridge_cidr(), ".lxd"]:
-        e = e.strip()
-        if e and e not in entries:
-            entries.append(e)
-    no_proxy = ",".join(entries)
+    no_proxy = no_proxy_list(*existing.split(","), "::1", ip, ".lxd")
     for k, v in (("http_proxy", url), ("HTTP_PROXY", url),
                  ("no_proxy", no_proxy), ("NO_PROXY", no_proxy)):
         print(f"export {k}={v}")
@@ -279,9 +298,9 @@ def build_parser():
                             formatter_class=argparse.RawDescriptionHelpFormatter)
         sp.set_defaults(func=func)
         if controller:
-            sp.add_argument("controller", nargs="?", default=DEFAULT_CONTROLLER,
+            sp.add_argument("controller", nargs="?", default=None,
                             metavar="CONTROLLER",
-                            help=f"Juju controller (default: {DEFAULT_CONTROLLER})")
+                            help="Juju controller (default: the current controller)")
         return sp
 
     add("enable", cmd_enable, "create the cache container and set Juju model-defaults")
