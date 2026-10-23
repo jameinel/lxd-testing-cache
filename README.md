@@ -18,9 +18,10 @@ and `snap-store-proxy` in one LXD container and points Juju model-defaults at th
 ./manage-cache.py disable    # clear defaults, stop container (cache kept)
 ```
 
-`enable` reuses an existing container and keeps its apt cache. The snap proxy
-needs a one-time `register-snap-proxy`, then `enable` again. See `--help` for
-the other commands and options (`--no-snap`, `apply`, ...).
+`enable` reuses an existing container and keeps its apt cache. It also points this
+host's apt and snapd at the caches (via `sudo`); `disable`/`destroy` undo that. The
+snap proxy needs a one-time `register-snap-proxy`, then `enable` again. See `--help`
+for the other commands and options (`--no-snap`, `--no-host`, `apply`, ...).
 
 ### charmcraft
 
