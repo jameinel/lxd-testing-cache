@@ -2,7 +2,7 @@
 
 ## Project
 
-`manage-apt-cache.py` is a single-file Python 3 CLI (stdlib only) that manages an
+`manage-cache.py` is a single-file Python 3 CLI (stdlib only) that manages an
 apt-cacher-ng LXD container and Juju model-defaults for faster Juju/LXD/charmcraft tests.
 See `README.md` for usage.
 
@@ -18,6 +18,6 @@ See `README.md` for usage.
 
 ## Checking changes
 
-- `python3 -m py_compile manage-apt-cache.py`
-- `./manage-apt-cache.py --help` and `<command> --help`
+- `python3 -m py_compile manage-cache.py`
+- `./manage-cache.py --help` and `<command> --help`
 - Don't run `enable`/`destroy` against the user's LXD/Juju without being asked.

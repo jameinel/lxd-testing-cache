@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Local apt cache (apt-cacher-ng in an LXD container) for faster Juju/LXD tests."""
+"""Local apt cache and snap store proxy (in an LXD container) for faster Juju/LXD tests."""
 
 import argparse
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
+import urllib.error
 import urllib.request
 
 NAME = os.environ.get("CACHE_NAME", "apt-cache")
@@ -17,6 +19,9 @@ IMAGE = os.environ.get("CACHE_IMAGE", "ubuntu:24.04")
 PORT = 3142
 LXD_CLOUD = os.environ.get("LXD_CLOUD_NAME", "lxd")
 NO_PROXY = "localhost,127.0.0.1"
+# snap-store-proxy serves on port 80 inside the container (not configurable).
+SNAP_KEYS = ("snap-store-proxy", "snap-store-proxy-url", "snap-store-assertions")
+DB_NAME = DB_USER = DB_PASS = "snapproxy"  # local-only database in the container
 
 EPILOG = textwrap.dedent(
     """\
@@ -34,14 +39,26 @@ EPILOG = textwrap.dedent(
       Charmcraft builds in its own LXD containers and ignores Juju settings.
       It forwards the host's http_proxy/no_proxy into the build container, so:
 
-          eval "$(manage-apt-cache.py charmcraft-env)"
+          eval "$(manage-cache.py charmcraft-env)"
           charmcraft pack
 
       charmcraft-env prints nothing if the container is stopped (disabled),
       missing or unreachable, so the eval is always safe.
 
       Only plain HTTP is cached (apt-cacher-ng); https_proxy is deliberately
-      not set. Snap, pip and other HTTPS downloads are not cached.
+      not set. pip and other HTTPS downloads are not cached.
+
+    snap store proxy:
+      'enable' also installs Canonical's snap-store-proxy (with PostgreSQL) in
+      the same container, listening on port 80 inside it; pass --no-snap to
+      skip it. If the container already exists (even stopped), it is reused
+      and the existing apt cache is preserved; the snap proxy is just added. It must be registered once with an Ubuntu One account:
+
+          manage-cache.py register-snap-proxy
+
+      After that, 'enable' (or 'apply') sets Juju's snap-store-proxy,
+      snap-store-proxy-url and snap-store-assertions so new machines fetch
+      snaps through the proxy. Until it is registered only apt is configured.
     """
 )
 
@@ -107,6 +124,98 @@ def reachable(ip):
     return True
 
 
+def lxc_exec(*cmd, **kw):
+    return run("lxc", "exec", NAME, "--", *cmd, **kw)
+
+
+def pg(*cmd, **kw):
+    return lxc_exec("runuser", "-u", "postgres", "--", *cmd, **kw)
+
+
+def snap_url(ip=None):
+    return f"http://{ip or cache_ip()}"
+
+
+def snap_reachable(ip):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        opener.open(f"{snap_url(ip)}/_status/check", timeout=5).close()
+    except urllib.error.HTTPError:
+        return True  # it answered
+    except OSError:
+        return False
+    return True
+
+
+def snap_proxy_installed():
+    return ok("lxc", "exec", NAME, "--", "snap", "list", "snap-store-proxy")
+
+
+def snap_assertions():
+    """(store_id, assertions) from the registered proxy, or None if not registered."""
+    ip = cache_ip()
+    if not ip or not snap_proxy_installed():
+        return None
+    # The proxy serves its store assertions over HTTP once registered.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"{snap_url(ip)}/v2/auth/store/assertions", timeout=10) as r:
+            text = r.read().decode().strip()
+    except OSError:
+        return None
+    m = re.search(r"^store:\s*(\S+)", text, re.M)
+    if not m:
+        return None
+    return m.group(1), text + "\n"
+
+
+def snap_settings():
+    """Juju config for the snap proxy, or {} if it is not usable (not registered)."""
+    found = snap_assertions()
+    if not found:
+        return {}
+    store, assertions = found
+    return {"snap-store-proxy": store,
+            "snap-store-proxy-url": snap_url(),
+            "snap-store-assertions": assertions}
+
+
+def setup_snap_proxy():
+    if snap_assertions():
+        return  # already set up and registered; leave a working proxy alone
+    # Safe on an existing apt-cache container: only adds packages, never touches
+    # apt-cacher-ng or its cache. Every step is idempotent so an interrupted
+    # setup can simply be re-run.
+    if not ok("lxc", "exec", NAME, "--", "dpkg", "-s", "postgresql"):
+        lxc_exec("apt-get", "update", quiet=True)
+        lxc_exec("env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                 "postgresql", quiet=True)
+    role = textwrap.dedent(
+        f"""\
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{DB_USER}') THEN
+            CREATE ROLE {DB_USER} LOGIN CREATEROLE PASSWORD '{DB_PASS}';
+          ELSE
+            ALTER ROLE {DB_USER} LOGIN CREATEROLE PASSWORD '{DB_PASS}';
+          END IF;
+        END $$;
+        """
+    )
+    pg("psql", "-c", role, quiet=True)
+    exists = pg("psql", "-tAc", f"SELECT 1 FROM pg_database WHERE datname='{DB_NAME}'",
+                capture=True).stdout or ""
+    if not exists.strip():
+        pg("createdb", "-O", DB_USER, DB_NAME)
+    for ext in ("pg_trgm", "btree_gist"):
+        pg("psql", "-d", DB_NAME, "-c", f"CREATE EXTENSION IF NOT EXISTS {ext}", quiet=True)
+    if not snap_proxy_installed():
+        lxc_exec("snap", "install", "snap-store-proxy")
+    # proxy.domain is the address registered with the store and handed to
+    # clients, so it must be the container's (pinned) IP, not 'localhost'.
+    lxc_exec("snap-store-proxy", "config", f"proxy.domain={cache_ip()}",
+             f"proxy.db.connection=postgresql://{DB_USER}:{DB_PASS}@localhost:5432/{DB_NAME}")
+
+
 def proxy_url(ip=None):
     ip = ip or cache_ip()
     if not ip:
@@ -147,8 +256,10 @@ def create_container():
         time.sleep(3)
 
 
-def define_cloud(url):
-    """Define a client-side cloud equal to localhost LXD plus the apt proxy."""
+def define_cloud(url, snap):
+    """Define a client-side cloud equal to localhost LXD plus the proxies."""
+    config = {"apt-http-proxy": url, "apt-no-proxy": no_proxy_list(), **snap}
+    # JSON is valid YAML and handles the multi-line assertions safely.
     body = textwrap.dedent(
         f"""\
         clouds:
@@ -157,9 +268,7 @@ def define_cloud(url):
             auth-types: [certificate]
             regions:
               localhost: {{}}
-            config:
-              apt-http-proxy: {url}
-              apt-no-proxy: {no_proxy_list()}
+            config: {json.dumps(config)}
         """
     )
     # snap-confined juju cannot read /tmp
@@ -182,17 +291,42 @@ def controller_label(a):
     return a.controller or "the current controller"
 
 
+def snap_args(a):
+    if a.no_snap:
+        return {}
+    return snap_settings()
+
+
 def cmd_enable(a):
     create_container()
+    if not a.no_snap:
+        setup_snap_proxy()
     url = proxy_url()
+    snap = snap_args(a)
     run("juju", "model-defaults", *controller_args(a),
-        f"apt-http-proxy={url}", f"apt-no-proxy={no_proxy_list()}")
-    define_cloud(url)
+        f"apt-http-proxy={url}", f"apt-no-proxy={no_proxy_list()}",
+        *[f"{k}={v}" for k, v in snap.items()])
+    define_cloud(url, snap)
     print(f"enabled: apt proxy {url} for new models on {controller_label(a)}")
+    if snap:
+        print(f"enabled: snap store proxy {snap_url()}")
+    elif not a.no_snap:
+        print("snap store proxy is not registered yet; run 'register-snap-proxy' "
+              "then 'enable' again")
+
+
+def cmd_register_snap_proxy(a):
+    if not snap_proxy_installed():
+        sys.exit("error: snap-store-proxy is not installed; run 'enable' first")
+    # Interactive: prompts for Ubuntu One credentials. Uses proxy.domain set by
+    # 'enable' and generates the proxy keys itself.
+    run("lxc", "exec", NAME, "--", "snap-store-proxy", "register")
+    print("registered; run 'enable' (or 'apply') to configure Juju")
 
 
 def cmd_disable(a):
-    run("juju", "model-defaults", *controller_args(a), "--reset", "apt-http-proxy,apt-no-proxy")
+    run("juju", "model-defaults", *controller_args(a), "--reset",
+        ",".join(("apt-http-proxy", "apt-no-proxy", *SNAP_KEYS)))
     run("juju", "remove-cloud", LXD_CLOUD, "--client", check=False, quiet=True)
     # A stopped container is what marks the cache as disabled; the cache is kept.
     if ok("lxc", "info", NAME):
@@ -224,7 +358,8 @@ def cmd_restore_os_upgrade(a):
 
 def cmd_apply(a):
     run("juju", "model-config", "-m", a.model,
-        f"apt-http-proxy={proxy_url()}", f"apt-no-proxy={no_proxy_list()}")
+        f"apt-http-proxy={proxy_url()}", f"apt-no-proxy={no_proxy_list()}",
+        *[f"{k}={v}" for k, v in snap_args(a).items()])
 
 
 def cmd_refresh_images(a):
@@ -245,11 +380,16 @@ def cmd_status(a):
     run("lxc", "list", NAME, "-c", "ns4", check=False)
     p = run("juju", "model-defaults", *controller_args(a), check=False, capture=True)
     for line in (p.stdout or "").splitlines():
-        if line.startswith(("apt-http-proxy", "apt-no-proxy", "enable-os-")):
+        if line.startswith(("apt-http-proxy", "apt-no-proxy", "enable-os-",
+                            "snap-store-proxy")):
             print(line)
     ip = cache_ip()
     if ip and reachable(ip):
         print(f"cache reachable at {ip}:{PORT}")
+    if ip and snap_proxy_installed():
+        state = "registered" if snap_assertions() else "NOT registered"
+        up = "reachable" if snap_reachable(ip) else "unreachable"
+        print(f"snap store proxy {up} at {snap_url(ip)} ({state})")
 
 
 def cmd_charmcraft_env(a):
@@ -286,7 +426,7 @@ def cmd_charmcraft_env(a):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="manage-apt-cache.py",
+        prog="manage-cache.py",
         description=__doc__,
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -303,7 +443,10 @@ def build_parser():
                             help="Juju controller (default: the current controller)")
         return sp
 
-    add("enable", cmd_enable, "create the cache container and set Juju model-defaults")
+    sp = add("enable", cmd_enable,
+             "create the cache container (apt + snap proxy) and set Juju model-defaults")
+    sp.add_argument("--no-snap", action="store_true",
+                    help="only set up the apt cache, not the snap store proxy")
     add("disable", cmd_disable, "clear Juju model-defaults and stop the container (cache is kept)")
     add("destroy", cmd_destroy, "disable, then delete the container and its cache")
     add("status", cmd_status, "show container, Juju defaults and cache reachability")
@@ -313,12 +456,16 @@ def build_parser():
         "restore apt update/upgrade on new Juju machines")
     add("refresh-images", cmd_refresh_images,
         "refresh cached LXD images Juju uses", controller=False)
+    add("register-snap-proxy", cmd_register_snap_proxy,
+        "register the snap store proxy with Ubuntu One (interactive, once)",
+        controller=False)
     sp = add("apply", cmd_apply, "point an existing Juju model at the cache",
              controller=False)
+    sp.add_argument("--no-snap", action="store_true", help="skip the snap store proxy")
     sp.add_argument("model", metavar="CONTROLLER:MODEL", help="model to configure")
     sp = add("charmcraft-env", cmd_charmcraft_env,
              "print shell exports so charmcraft builds use the cache\n\n"
-             "usage: eval \"$(manage-apt-cache.py charmcraft-env)\"\n\n"
+             "usage: eval \"$(manage-cache.py charmcraft-env)\"\n\n"
              "Prints nothing on stdout (and a note on stderr, exit 0) if the cache\n"
              "container is stopped, missing or unreachable, so it is safe to run\n"
              "unconditionally before a build.",
