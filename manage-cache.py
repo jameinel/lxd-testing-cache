@@ -20,6 +20,9 @@ PORT = 3142
 LXD_CLOUD = os.environ.get("LXD_CLOUD_NAME", "lxd")
 NO_PROXY = "localhost,127.0.0.1"
 # snap-store-proxy serves on port 80 inside the container (not configurable).
+# apt reuses the http proxy for https unless told otherwise, and apt-cacher-ng
+# refuses CONNECT; "DIRECT" makes https repos bypass the cache.
+HTTPS_DIRECT = "DIRECT"
 SNAP_KEYS = ("snap-store-proxy", "snap-store-proxy-url", "snap-store-assertions")
 DB_NAME = DB_USER = DB_PASS = "snapproxy"  # local-only database in the container
 HOST_APT_CONF = "/etc/apt/apt.conf.d/01lxd-testing-cache"
@@ -47,7 +50,9 @@ EPILOG = textwrap.dedent(
       missing or unreachable, so the eval is always safe.
 
       Only plain HTTP is cached (apt-cacher-ng); https_proxy is deliberately
-      not set. pip and other HTTPS downloads are not cached.
+      not set. pip and other HTTPS downloads are not cached. apt https
+      repositories are fetched directly (apt https proxy = DIRECT), since
+      apt would otherwise send them through the HTTP-only cache and fail.
 
     snap store proxy:
       'enable' also installs Canonical's snap-store-proxy (with PostgreSQL) in
@@ -268,7 +273,8 @@ def create_container():
 
 def define_cloud(url, snap):
     """Define a client-side cloud equal to localhost LXD plus the proxies."""
-    config = {"apt-http-proxy": url, "apt-no-proxy": no_proxy_list(), **snap}
+    config = {"apt-http-proxy": url, "apt-https-proxy": HTTPS_DIRECT,
+              "apt-no-proxy": no_proxy_list(), **snap}
     # JSON is valid YAML and handles the multi-line assertions safely.
     body = textwrap.dedent(
         f"""\
@@ -323,7 +329,7 @@ def host_snap_store():
 
 def configure_host(url, snap):
     """Point this host's apt and snapd at the caches; only sudo when needed."""
-    conf = f'Acquire::http::Proxy "{url}";\n'
+    conf = f'Acquire::http::Proxy "{url}";\nAcquire::https::Proxy "{HTTPS_DIRECT}";\n'
     if host_apt_proxy() != conf:
         run("sudo", "tee", HOST_APT_CONF, input=conf, quiet=True)
         print(f"host: apt proxy {url} ({HOST_APT_CONF})")
@@ -353,7 +359,8 @@ def cmd_enable(a):
     url = proxy_url()
     snap = snap_args(a)
     run("juju", "model-defaults", *controller_args(a),
-        f"apt-http-proxy={url}", f"apt-no-proxy={no_proxy_list()}",
+        f"apt-http-proxy={url}", f"apt-https-proxy={HTTPS_DIRECT}",
+        f"apt-no-proxy={no_proxy_list()}",
         *[f"{k}={v}" for k, v in snap.items()])
     define_cloud(url, snap)
     if not a.no_host:
@@ -377,7 +384,7 @@ def cmd_register_snap_proxy(a):
 
 def cmd_disable(a):
     run("juju", "model-defaults", *controller_args(a), "--reset",
-        ",".join(("apt-http-proxy", "apt-no-proxy", *SNAP_KEYS)))
+        ",".join(("apt-http-proxy", "apt-https-proxy", "apt-no-proxy", *SNAP_KEYS)))
     run("juju", "remove-cloud", LXD_CLOUD, "--client", check=False, quiet=True)
     unconfigure_host()
     # A stopped container is what marks the cache as disabled; the cache is kept.
@@ -410,7 +417,8 @@ def cmd_restore_os_upgrade(a):
 
 def cmd_apply(a):
     run("juju", "model-config", "-m", a.model,
-        f"apt-http-proxy={proxy_url()}", f"apt-no-proxy={no_proxy_list()}",
+        f"apt-http-proxy={proxy_url()}", f"apt-https-proxy={HTTPS_DIRECT}",
+        f"apt-no-proxy={no_proxy_list()}",
         *[f"{k}={v}" for k, v in snap_args(a).items()])
 
 
@@ -432,7 +440,7 @@ def cmd_status(a):
     run("lxc", "list", NAME, "-c", "ns4", check=False)
     p = run("juju", "model-defaults", *controller_args(a), check=False, capture=True)
     for line in (p.stdout or "").splitlines():
-        if line.startswith(("apt-http-proxy", "apt-no-proxy", "enable-os-",
+        if line.startswith(("apt-http-proxy", "apt-https-proxy", "apt-no-proxy", "enable-os-",
                             "snap-store-proxy")):
             print(line)
     ip = cache_ip()
