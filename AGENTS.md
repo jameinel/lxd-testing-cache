@@ -12,7 +12,7 @@ See `README.md` for usage.
 - Shell out to `lxc` and `juju` via the `run()`/`ok()` helpers.
 - Each subcommand is a `cmd_*` function registered in `build_parser()`; update the
   `EPILOG` text and `README.md` when adding or changing commands or env vars.
-- `charmcraft-env` must stay safe to `eval`: emit shell only on stdout, notes on stderr, exit 0.
+- `charmcraft env` must stay safe to `eval`: emit shell only on stdout, notes on stderr, exit 0.
 - Only HTTP is cached; do not set `https_proxy`.
 - Project name is `lxd-testing-cache` (not `lxd-test-cache`).
 
@@ -20,4 +20,4 @@ See `README.md` for usage.
 
 - `python3 -m py_compile manage-cache.py`
 - `./manage-cache.py --help` and `<command> --help`
-- Don't run `enable`/`destroy` against the user's LXD/Juju without being asked.
+- Don't run `setup`/`cache destroy` against the user's LXD/Juju without being asked.
