@@ -14,6 +14,7 @@ import tempfile
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 NAME = os.environ.get("CACHE_NAME", "apt-cache")
@@ -49,6 +50,11 @@ EPILOG = textwrap.dedent(
       'controller remove' removes tool-managed settings. Both inspect all
       targets before changing them; --exclude-model may be repeated.
       CONTROLLER defaults to JUJU_CONTROLLER or Juju's current controller.
+
+    images:
+      'images refresh' refreshes sourced Juju images and repairs source-less
+      Ubuntu images using their Juju alias. Repair may delete and re-import an
+      image; it preserves its aliases and backs it up before deletion.
 
     charmcraft:
       Charmcraft builds in its own LXD containers and ignores Juju settings.
@@ -859,18 +865,149 @@ def cmd_restore_os_upgrade(a):
     _os_upgrade(a, "true")
 
 
+def image_list(*args):
+    return json.loads(run("lxc", "image", "list", *(args or ("local:",)), "--format", "json",
+                          capture=True).stdout)
+
+
+def image_alias_path(alias):
+    return "local:/1.0/images/aliases/" + urllib.parse.quote(alias, safe="")
+
+
+def patch_image(fp, values):
+    run("lxc", "query", "-X", "PATCH", f"local:/1.0/images/{fp}",
+        "-d", json.dumps(values))
+
+
+def restore_image_settings(image, auto_update):
+    settings = {key: image[key] for key in ("public", "properties", "expires_at", "profiles")
+                if key in image}
+    settings["auto_update"] = auto_update
+    run("lxc", "query", "-X", "PUT", f"local:/1.0/images/{image['fingerprint']}",
+        "-d", json.dumps(settings))
+
+
+def restore_image_aliases(image, fp):
+    for alias in image.get("aliases") or []:
+        run("lxc", "image", "alias", "create", f"local:{alias['name']}", fp)
+        if alias.get("description"):
+            run("lxc", "query", "-X", "PATCH", image_alias_path(alias["name"]),
+                "-d", json.dumps({"description": alias["description"]}))
+
+
+def reimport_image(image, source, vm):
+    """Re-import a duplicate fingerprint without losing its other aliases."""
+    fp = image["fingerprint"]
+    backup = tempfile.mkdtemp(prefix="lxd-testing-cache-image-")
+    prefix = os.path.join(backup, "image")
+    try:
+        run("lxc", "image", "export", f"local:{fp}", prefix, *(["--vm"] if vm else []))
+        files = [os.path.join(backup, name) for name in os.listdir(backup)
+                 if name.startswith("image") and not name.endswith(".root")]
+        if len(files) != 1:
+            sys.exit(f"error: cannot identify exported image in {backup}")
+        root = prefix + ".root"
+        import_files = files + ([root] if os.path.exists(root) else [])
+        with open(os.path.join(backup, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(image, f)
+    except (subprocess.CalledProcessError, SystemExit):
+        shutil.rmtree(backup)
+        raise
+
+    print(f"backed up image {fp} to {backup} before re-import")
+    try:
+        run("lxc", "image", "delete", f"local:{fp}")
+        copy = ["lxc", "image", "copy", source, "local:", "--auto-update"]
+        if vm:
+            copy.append("--vm")
+        for profile in image.get("profiles") or []:
+            copy.extend(["--profile", profile])
+        if image.get("public"):
+            copy.append("--public")
+        run(*copy)
+        # The source might change between discovery and the copy.
+        current = {item["fingerprint"]: item for item in image_list()}
+        if fp not in current or not current[fp].get("update_source"):
+            sys.exit(f"error: re-import did not restore source for {fp}")
+        restore_image_settings(image, True)
+        restore_image_aliases(image, fp)
+    except (subprocess.CalledProcessError, SystemExit) as error:
+        print(f"error: re-import failed; restoring image {fp}", file=sys.stderr)
+        try:
+            current = {item["fingerprint"]: item for item in image_list()}
+            if fp not in current:
+                run("lxc", "image", "import", *import_files, "local:")
+            restore_image_settings(image, bool(current.get(fp, {}).get("update_source")))
+            existing = {alias["name"] for alias in
+                        next(item for item in image_list() if item["fingerprint"] == fp).get("aliases", [])}
+            missing = dict(image, aliases=[alias for alias in image.get("aliases") or []
+                                           if alias["name"] not in existing])
+            restore_image_aliases(missing, fp)
+        except (subprocess.CalledProcessError, StopIteration) as restore_error:
+            sys.exit(f"error: recovery failed ({restore_error}); image backup is in {backup}")
+        shutil.rmtree(backup)
+        raise error
+    shutil.rmtree(backup)
+
+
 def cmd_refresh_images(a):
-    # Images with no recorded source are pinned and cannot be refreshed; re-import
-    # them with: lxc image copy ubuntu:<version> local: [--vm] --auto-update
-    p = run("lxc", "image", "list", "-c", "lf", "--format", "csv", capture=True)
-    for line in p.stdout.splitlines():
-        alias, _, fp = line.partition(",")
-        if not alias.startswith("juju/"):
+    images = image_list()
+    aliases = [alias["name"] for image in images for alias in image.get("aliases") or []
+               if alias["name"].startswith("juju/")]
+    for alias in aliases:
+        images = image_list()
+        image = next((item for item in images if any(
+            entry["name"] == alias for entry in item.get("aliases") or [])), None)
+        if image is None:
+            sys.exit(f"error: image alias {alias!r} disappeared")
+        fp = image["fingerprint"]
+        if image.get("update_source") and not image.get("cached"):
+            if not image.get("auto_update"):
+                patch_image(fp, {"auto_update": True})
+            run("lxc", "image", "refresh", f"local:{fp}")
             continue
-        info = run("lxc", "image", "info", fp, capture=True).stdout or ""
-        if not any(l.startswith("    Server:") for l in info.splitlines()):
-            print(f"WARNING: image {fp} has no update source (pinned)", file=sys.stderr)
-        run("lxc", "image", "refresh", fp)
+
+        match = re.fullmatch(r"juju/ubuntu@([0-9]+\.[0-9]+)/([a-z0-9_]+)", alias)
+        if not match or image["type"] not in ("container", "virtual-machine"):
+            sys.exit(f"error: cannot determine update source for {alias!r}")
+        remote_alias = f"{match[1]}/{match[2]}"
+        candidates = [item for item in image_list(f"ubuntu:{remote_alias}")
+                      if item["type"] == image["type"] and any(
+                          entry["name"] == remote_alias for entry in item["aliases"])]
+        if len(candidates) != 1:
+            sys.exit(f"error: cannot uniquely resolve ubuntu:{remote_alias} ({image['type']})")
+        remote_image = candidates[0]
+        target_fp = remote_image["fingerprint"]
+        target = next((item for item in images if item["fingerprint"] == target_fp), None)
+        vm = image["type"] == "virtual-machine"
+        source = f"ubuntu:{remote_alias}"
+        if target and not target.get("update_source"):
+            reimport_image(target, source, vm)
+        elif target:
+            remotes = json.loads(run("lxc", "remote", "list", "--format", "json",
+                                     capture=True).stdout)
+            update = target["update_source"]
+            if (update.get("server", "").rstrip("/") != remotes["ubuntu"]["Addr"].rstrip("/")
+                    or update.get("protocol") != "simplestreams"
+                    or update.get("alias") not in
+                    {entry["name"] for entry in remote_image["aliases"]}):
+                sys.exit(f"error: existing image {target_fp} has a different update source")
+            if not target.get("auto_update"):
+                patch_image(target_fp, {"auto_update": True})
+            if target.get("cached"):
+                run("lxc", "image", "copy", source, "local:", "--auto-update",
+                    *(["--vm"] if vm else []))
+                restore_image_settings(target, True)
+        else:
+            run("lxc", "image", "copy", source, "local:", "--auto-update",
+                *(["--vm"] if vm else []))
+        current = next((item for item in image_list() if item["fingerprint"] == target_fp), None)
+        if (not current or not current.get("update_source") or
+                not current.get("auto_update") or current.get("cached")):
+            sys.exit(f"error: image {target_fp} does not have an enabled update source")
+        if target_fp != fp:
+            run("lxc", "query", "-X", "PATCH", image_alias_path(alias),
+                "-d", json.dumps({"target": target_fp}))
 
 
 def cmd_status(a):

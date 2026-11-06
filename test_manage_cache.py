@@ -235,6 +235,201 @@ class LocalSetupTests(unittest.TestCase):
         self.assertIn("not using a cache", stderr.getvalue())
 
 
+class ImageRefreshTests(unittest.TestCase):
+    def image(self, fp, alias, **extra):
+        return {
+            "fingerprint": fp, "aliases": [{"name": alias, "description": ""}],
+            "type": "container", "public": False, "properties": {},
+            "profiles": ["default"], "expires_at": "2029-01-01T00:00:00Z",
+            **extra,
+        }
+
+    def test_sourced_image_is_enabled_and_refreshed(self):
+        image = self.image("old", "juju/ubuntu@24.04/amd64",
+                           update_source={"alias": "24.04"}, auto_update=False)
+        with patch.object(cache, "image_list", return_value=[image]), \
+             patch.object(cache, "run") as run:
+            cache.cmd_refresh_images(None)
+        self.assertEqual(run.call_args_list, [
+            unittest.mock.call("lxc", "query", "-X", "PATCH", "local:/1.0/images/old",
+                               "-d", '{"auto_update": true}'),
+            unittest.mock.call("lxc", "image", "refresh", "local:old"),
+        ])
+
+    def test_source_less_image_uses_version_and_architecture(self):
+        alias = "juju/ubuntu@24.04/arm64"
+        old = self.image("old", alias)
+        remote = self.image("new", "24.04/arm64")
+        new = self.image("new", "other", update_source={"alias": "24.04/arm64"},
+                         auto_update=True)
+        with patch.object(cache, "image_list", side_effect=[
+                [old], [old], [remote], [old, new]]), \
+             patch.object(cache, "run") as run:
+            cache.cmd_refresh_images(None)
+        run.assert_any_call("lxc", "image", "copy", "ubuntu:24.04/arm64",
+                            "local:", "--auto-update")
+        run.assert_any_call("lxc", "query", "-X", "PATCH",
+                            "local:/1.0/images/aliases/juju%2Fubuntu%4024.04%2Farm64",
+                            "-d", '{"target": "new"}')
+
+    def test_existing_sourced_target_is_reused_without_deletion(self):
+        alias = "juju/ubuntu@24.04/amd64"
+        old = self.image("old", alias)
+        remote = self.image("new", "24.04/amd64")
+        remote["aliases"].append({"name": "24.04"})
+        target = self.image("new", "other", auto_update=True, update_source={
+            "server": "https://cloud-images.ubuntu.com/releases",
+            "protocol": "simplestreams", "alias": "24.04",
+        })
+        remotes = {"ubuntu": {"Addr": "https://cloud-images.ubuntu.com/releases/"}}
+        with patch.object(cache, "image_list", side_effect=[
+                [old, target], [old, target], [remote], [old, target]]), \
+             patch.object(cache, "run", return_value=SimpleNamespace(
+                 stdout=json.dumps(remotes))) as run:
+            cache.cmd_refresh_images(None)
+        self.assertFalse(any(call.args[:3] == ("lxc", "image", "delete")
+                             for call in run.call_args_list))
+        run.assert_any_call("lxc", "query", "-X", "PATCH",
+                            "local:/1.0/images/aliases/juju%2Fubuntu%4024.04%2Famd64",
+                            "-d", '{"target": "new"}')
+
+    def test_existing_cached_target_is_made_permanent(self):
+        old = self.image("old", "juju/ubuntu@24.04/amd64")
+        remote = self.image("new", "24.04/amd64")
+        target = self.image("new", "other", cached=True, auto_update=True,
+                            update_source={"server": "https://ubuntu.example",
+                                           "protocol": "simplestreams",
+                                           "alias": "24.04/amd64"})
+        permanent = dict(target, cached=False)
+        remotes = {"ubuntu": {"Addr": "https://ubuntu.example"}}
+        with patch.object(cache, "image_list", side_effect=[
+                [old, target], [old, target], [remote], [old, permanent]]), \
+             patch.object(cache, "run", return_value=SimpleNamespace(
+                 stdout=json.dumps(remotes))) as run:
+            cache.cmd_refresh_images(None)
+        run.assert_any_call("lxc", "image", "copy", "ubuntu:24.04/amd64",
+                            "local:", "--auto-update")
+        self.assertTrue(any(call.args[:4] == ("lxc", "query", "-X", "PUT")
+                            for call in run.call_args_list))
+
+    def test_duplicate_source_less_vm_is_reimported(self):
+        image = self.image("same", "juju/ubuntu@24.04/amd64", type="virtual-machine")
+        remote = self.image("same", "24.04/amd64", type="virtual-machine")
+        sourced = dict(image, update_source={"alias": "24.04/amd64"}, auto_update=True)
+        with patch.object(cache, "image_list", side_effect=[
+                [image], [image], [remote], [sourced]]), \
+             patch.object(cache, "reimport_image") as reimport, \
+             patch.object(cache, "run") as run:
+            cache.cmd_refresh_images(None)
+        reimport.assert_called_once_with(image, "ubuntu:24.04/amd64", True)
+        run.assert_not_called()
+
+    def test_reimport_duplicate_preserves_aliases_and_settings(self):
+        image = self.image("same", "juju/ubuntu@20.04/amd64")
+        image["aliases"].append({"name": "other", "description": "keep"})
+        sourced = dict(image, update_source={"alias": "20.04/amd64"}, auto_update=True)
+
+        def respond(*args, **kwargs):
+            if args[:3] == ("lxc", "image", "export"):
+                with open(args[4] + ".tar.xz", "w", encoding="utf-8") as f:
+                    f.write("backup")
+            return SimpleNamespace(stdout="")
+
+        with patch.object(cache, "image_list", return_value=[sourced]), \
+             patch.object(cache, "run", side_effect=respond) as run:
+            cache.reimport_image(image, "ubuntu:20.04/amd64", False)
+        run.assert_any_call("lxc", "image", "delete", "local:same")
+        run.assert_any_call("lxc", "image", "copy", "ubuntu:20.04/amd64",
+                            "local:", "--auto-update", "--profile", "default")
+        run.assert_any_call("lxc", "image", "alias", "create", "local:other", "same")
+        run.assert_any_call("lxc", "query", "-X", "PATCH",
+                            "local:/1.0/images/aliases/other", "-d", '{"description": "keep"}')
+        settings_call = next(call for call in run.call_args_list
+                             if call.args[:4] == ("lxc", "query", "-X", "PUT"))
+        settings = json.loads(settings_call.args[-1])
+        self.assertTrue(settings["auto_update"])
+        self.assertEqual(settings["profiles"], ["default"])
+
+    def test_failed_reimport_restores_exported_image(self):
+        image = self.image("same", "juju/ubuntu@20.04/amd64")
+        restored = dict(image, aliases=[])
+
+        def respond(*args, **kwargs):
+            if args[:3] == ("lxc", "image", "export"):
+                with open(args[4] + ".tar.xz", "w", encoding="utf-8") as f:
+                    f.write("backup")
+            if args[:3] == ("lxc", "image", "copy"):
+                raise subprocess.CalledProcessError(1, args)
+            return SimpleNamespace(stdout="")
+
+        with patch.object(cache, "image_list", side_effect=[[], [restored]]), \
+             patch.object(cache, "run", side_effect=respond) as run, \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                cache.reimport_image(image, "ubuntu:20.04/amd64", False)
+        self.assertTrue(any(call.args[:3] == ("lxc", "image", "import")
+                            for call in run.call_args_list))
+        run.assert_any_call("lxc", "image", "alias", "create",
+                            "local:juju/ubuntu@20.04/amd64", "same")
+
+    def test_failed_vm_reimport_restores_both_export_files(self):
+        image = self.image("same", "juju/ubuntu@24.04/amd64", type="virtual-machine")
+        restored = dict(image, aliases=[])
+
+        def respond(*args, **kwargs):
+            if args[:3] == ("lxc", "image", "export"):
+                for path in (args[4], args[4] + ".root"):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("backup")
+            if args[:3] == ("lxc", "image", "copy"):
+                raise subprocess.CalledProcessError(1, args)
+            return SimpleNamespace(stdout="")
+
+        with patch.object(cache, "image_list", side_effect=[[], [restored]]), \
+             patch.object(cache, "run", side_effect=respond) as run, \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                cache.reimport_image(image, "ubuntu:24.04/amd64", True)
+        export = next(call for call in run.call_args_list
+                      if call.args[:3] == ("lxc", "image", "export"))
+        self.assertEqual(export.args[-1], "--vm")
+        imported = next(call for call in run.call_args_list
+                        if call.args[:3] == ("lxc", "image", "import"))
+        self.assertEqual(imported.args[4], imported.args[3] + ".root")
+
+    def test_failed_recovery_keeps_backup(self):
+        image = self.image("same", "juju/ubuntu@20.04/amd64")
+
+        def respond(*args, **kwargs):
+            if args[:3] == ("lxc", "image", "export"):
+                with open(args[4] + ".tar.xz", "w", encoding="utf-8") as f:
+                    f.write("backup")
+            if args[:3] in (("lxc", "image", "copy"), ("lxc", "image", "import")):
+                raise subprocess.CalledProcessError(1, args)
+            return SimpleNamespace(stdout="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            backup = os.path.join(directory, "backup")
+            os.mkdir(backup)
+            with patch.object(cache.tempfile, "mkdtemp", return_value=backup), \
+                 patch.object(cache, "image_list", return_value=[]), \
+                 patch.object(cache, "run", side_effect=respond), \
+                 redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "image backup is in"):
+                    cache.reimport_image(image, "ubuntu:20.04/amd64", False)
+            self.assertTrue(os.path.isfile(os.path.join(backup, "image.tar.xz")))
+            with open(os.path.join(backup, "metadata.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f), image)
+
+    def test_unknown_source_less_alias_is_rejected(self):
+        image = self.image("old", "juju/custom@24.04/amd64")
+        with patch.object(cache, "image_list", return_value=[image]), \
+             patch.object(cache, "run") as run:
+            with self.assertRaisesRegex(SystemExit, "cannot determine update source"):
+                cache.cmd_refresh_images(None)
+        run.assert_not_called()
+
+
 class JujuCommandsTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

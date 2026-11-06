@@ -61,9 +61,20 @@ removing client settings; `cache destroy --force` also deletes its cache and
 registration. Remove settings from every consumer first: the tool cannot
 discover every client that depends on the cache.
 
-Other commands use resource/action names: `snap register`, `upgrade skip`,
-`upgrade restore`, and `images refresh`. The previous standalone `enable`,
-`disable`, `destroy`, `apply`, and hyphenated commands have been removed.
+`images refresh` refreshes Juju images with a recorded source and enables
+their LXD auto-update. For source-less `juju/ubuntu@VERSION/ARCH` images, it
+finds the matching container or VM image on the `ubuntu:` remote and enables
+auto-update. If that fingerprint already exists without a source, it backs up
+the image, deletes it, and re-imports it, preserving its aliases and settings.
+If re-import fails, it attempts to restore the backup; if recovery fails, it
+reports the backup location. Other source-less aliases and incompatible
+existing image sources require manual intervention. LXD's auto-update interval
+must be enabled for subsequent automatic updates; a source can still publish
+an expired image. Existing instances are not updated.
+
+Other commands use resource/action names: `snap register`, `upgrade skip`, and
+`upgrade restore`. The previous standalone `enable`, `disable`, `destroy`,
+`apply`, and hyphenated commands have been removed.
 
 ### charmcraft
 
